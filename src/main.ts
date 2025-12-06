@@ -1,36 +1,106 @@
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import {Octokit} from '@octokit/rest'
 
 async function run(): Promise<void> {
   try {
     const token = core.getInput('github-token')
     const appId: string = core.getInput('app-id')
+    const reviewUrl: string = core.getInput('review-url')
+    const buildUrlInput: string = core.getInput('build-url')
+    const storybookUrlInput: string = core.getInput('storybook-url')
 
-    if (!token) throw new Error('github-token is required')
-    if (!appId) throw new Error('appId is required')
+    if (!token) {
+      throw new Error('github-token is required')
+    }
 
-    const octokit = new Octokit({auth: `token ${token}`})
+    if ((!buildUrlInput || !storybookUrlInput) && !appId) {
+      throw new Error(
+        'app-id is required, when build-url and storybook-url are not provided'
+      )
+    }
 
     const {
       repo: {repo, owner},
-      issue: {number},
-      payload
+      sha,
+      ref
     } = github.context
+
+    let {number} = github.context.issue
+
+    const octokit = github.getOctokit(token)
+
+    if (!number) {
+      try {
+        // Based on https://github.com/orgs/community/discussions/27071#discussioncomment-4943026
+        const result =
+          await octokit.rest.repos.listPullRequestsAssociatedWithCommit({
+            commit_sha: sha,
+            owner,
+            repo
+          })
+
+        number = result.data[0].number
+      } catch (e) {
+        if (e instanceof Error) core.error(e)
+        throw new Error(
+          'No issue number found preventing any comment from being added or updated. This will happen if your action is ran on push and an associated PR is not found.'
+        )
+      }
+    }
+
+    let branch: string | undefined
+    if (github.context.eventName === 'pull_request') {
+      branch = process.env.GITHUB_HEAD_REF
+    } else {
+      // Other events where we have to extract branch from the ref
+      // Ref example: refs/heads/master, refs/tags/X
+      const branchParts = ref.split('/')
+      branch = branchParts.slice(2).join('/')
+    }
+
+    const branchName = branch
+      ?.replace('refs/heads/', '')
+      .replace('/', '-')
+      .substr(0, 37)
+
+    if (!branchName) throw new Error('Could not find branch name')
+
+    // Do not use ?? as the default input is an empty string
+    // fallback to using the app-id based url
+    const buildUrl =
+      buildUrlInput || `https://www.chromatic.com/build?appId=${appId}`
+    const branchStorybookUrl = `https://${branchName}--${appId}.chromatic.com`
+    const storybookUrl = storybookUrlInput || branchStorybookUrl
 
     core.debug(`Using appid: ${appId}`) // debug is only output if you set the secret `ACTIONS_STEP_DEBUG` to true
 
     const commentFindBy = `<!-- Created by storybook-chromatic-link-comment -->`
 
-    const branchName = payload.pull_request?.head.ref
-      .replace('refs/heads/', '')
-      .replace('/', '-')
+    const comment = `${commentFindBy}
+## 🔍 Visual review for your branch is published 🔍
 
-    if (!branchName) throw new Error('Could not find branch name')
+Here are the links to:
 
-    const comment = `${commentFindBy}\nHeres the [storybook](https://${branchName}--${appId}.chromatic.com) for your branch`
+${
+  reviewUrl
+    ? `
+- the [Visual Review Page](${reviewUrl})
+`
+    : ``
+}
+- the [latest build on chromatic](${buildUrl})
+- the [full storybook](${storybookUrl})
+${
+  appId
+    ? `
+- the [branch specific storybook](${branchStorybookUrl})
+`
+    : ``
+}
+`
 
-    const {data: comments} = await octokit.issues.listComments({
+    core.debug(`owner: ${owner}, repo: ${repo}, issue_number: ${number}`)
+    const {data: comments} = await octokit.rest.issues.listComments({
       owner,
       repo,
       issue_number: number,
@@ -44,8 +114,16 @@ async function run(): Promise<void> {
     if (!existingComment && comments.length < 100) {
       core.info(`Leaving comment: ${comment}`)
 
-      octokit.issues.createComment({
+      await octokit.rest.issues.createComment({
         issue_number: number,
+        owner,
+        repo,
+        body: comment
+      })
+    } else if (existingComment) {
+      core.info(`attempting to update existing comment: ${existingComment.id}`)
+      await octokit.rest.issues.updateComment({
+        comment_id: existingComment.id,
         owner,
         repo,
         body: comment
